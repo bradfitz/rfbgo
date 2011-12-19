@@ -28,13 +28,18 @@ func main() {
 }
 
 const (
-	v3              = "RFB 003.003\n"
-	v7              = "RFB 003.007\n"
-	v8              = "RFB 003.008\n"
-	authNone        = 1
-	statusOK        = 0
-	statusFailed    = 1
-	cmdSetEncodings = 2
+	v3                          = "RFB 003.003\n"
+	v7                          = "RFB 003.007\n"
+	v8                          = "RFB 003.008\n"
+	authNone                    = 1
+	statusOK                    = 0
+	statusFailed                = 1
+	cmdSetPixelFormat           = 0
+	cmdSetEncodings             = 2
+	cmdFramebufferUpdateRequest = 3
+	cmdKeyEvent                 = 4
+	cmdPointerEvent             = 5
+	cmdClientCutText            = 6
 )
 
 type Conn struct {
@@ -49,6 +54,12 @@ func (c *Conn) readByte(what string) byte {
 		c.failf("reading client byte for %q: %v", what, err)
 	}
 	return b
+}
+
+func (c *Conn) readPadding(what string, size int) {
+	for i := 0; i < size; i++ {
+		c.readByte(what)
+	}
 }
 
 func (c *Conn) read(what string, v interface{}) {
@@ -121,6 +132,9 @@ func (c *Conn) serve() {
 	_ = wantShared
 
 	// 6.3.2. ServerInit
+	// TODO: send what Screens requests? PixelFormat{BPP:0x10, Depth:0x10,
+	// BigEndian:0x0, TrueColour:0x1, RedMax:0x1f, GreenMax:0x1f,
+	// BlueMax:0x1f, RedShift:0xa, GreenShift:0x5, BlueShift:0x0}
 	width, height := 1024, 768
 	c.w(uint16(width))
 	c.w(uint16(height))
@@ -143,19 +157,52 @@ func (c *Conn) serve() {
 	c.flush()
 
 	for {
+		log.Printf("awaiting command byte from client...")
 		cmd := c.readByte("6.4:client-server-packet-type")
 		log.Printf("got command type %d from client", int(cmd))
 		switch cmd {
+		case cmdSetPixelFormat:
+			c.handleSetPixelFormat()
 		case cmdSetEncodings:
 			c.handleSetEncodings()
+		case cmdFramebufferUpdateRequest:
+			c.handleUpdateRequest()
 		default:
 			c.failf("unsupported command type %d from client", int(cmd))
 		}
 	}
 }
 
+type PixelFormat struct {
+	BPP, Depth                      uint8
+	BigEndian, TrueColour           uint8 // flags; 0 or non-zero
+	RedMax, GreenMax, BlueMax       uint16
+	RedShift, GreenShift, BlueShift uint8
+}
+
+// 6.4.1
+func (c *Conn) handleSetPixelFormat() {
+	log.Printf("handling setpixel format")
+	c.readPadding("SetPixelFormat padding", 3)
+	var pf PixelFormat
+	c.read("pixelformat.bpp", &pf.BPP)
+	c.read("pixelformat.depth", &pf.Depth)
+	c.read("pixelformat.beflag", &pf.BigEndian)
+	c.read("pixelformat.truecolour", &pf.TrueColour)
+	c.read("pixelformat.redmax", &pf.RedMax)
+	c.read("pixelformat.greenmax", &pf.GreenMax)
+	c.read("pixelformat.bluemax", &pf.BlueMax)
+	c.read("pixelformat.redshift", &pf.RedShift)
+	c.read("pixelformat.greenshift", &pf.GreenShift)
+	c.read("pixelformat.blueshift", &pf.BlueShift)
+	c.readPadding("SetPixelFormat pixel format padding", 3)
+	log.Printf("Client wants pixel format: %#v", pf)
+}
+
+// 6.4.2
 func (c *Conn) handleSetEncodings() {
-	c.readByte("6.4.2:padding")
+	c.readPadding("SetEncodings padding", 1)
+
 	var numEncodings uint16
 	c.read("6.4.2:number-of-encodings", &numEncodings)
 	var encType []int32
@@ -165,4 +212,22 @@ func (c *Conn) handleSetEncodings() {
 		encType = append(encType, t)
 	}
 	log.Printf("Client encodings: %#v", encType)
+
+}
+
+// 6.4.3
+type FrameBufferUpdateRequest struct {
+	IncrementalFlag     uint8
+	X, Y, Width, Height uint16
+}
+
+// 6.4.3
+func (c *Conn) handleUpdateRequest() {
+	var req FrameBufferUpdateRequest
+	c.read("framebuffer-update.incremental", &req.IncrementalFlag)
+	c.read("framebuffer-update.x", &req.X)
+	c.read("framebuffer-update.y", &req.Y)
+	c.read("framebuffer-update.width", &req.Width)
+	c.read("framebuffer-update.height", &req.Height)
+	log.Printf("client requests update: %#v", req)
 }
