@@ -167,6 +167,10 @@ func (c *Conn) serve() {
 			c.handleSetEncodings()
 		case cmdFramebufferUpdateRequest:
 			c.handleUpdateRequest()
+		case cmdPointerEvent:
+			c.handlePointerEvent()
+		case cmdKeyEvent:
+			c.handleKeyEvent()
 		default:
 			c.failf("unsupported command type %d from client", int(cmd))
 		}
@@ -230,4 +234,34 @@ func (c *Conn) handleUpdateRequest() {
 	c.read("framebuffer-update.width", &req.Width)
 	c.read("framebuffer-update.height", &req.Height)
 	log.Printf("client requests update: %#v", req)
+}
+
+// 6.4.4
+type KeyEvent struct {
+	DownFlag uint8
+	Key      uint32
+}
+
+// 6.4.4
+func (c *Conn) handleKeyEvent() {
+	var req KeyEvent
+	c.read("key-event.downflag", &req.DownFlag)
+	c.readPadding("key-event.padding", 2)
+	c.read("key-event.key", &req.Key)
+	log.Printf("%#v", req)
+}
+
+// 6.4.5
+type PointerEvent struct {
+	ButtonMask uint8
+	X, Y       uint16
+}
+
+// 6.4.5
+func (c *Conn) handlePointerEvent() {
+	var req PointerEvent
+	c.read("pointer-event.mask", &req.ButtonMask)
+	c.read("pointer-event.x", &req.X)
+	c.read("pointer-event.y", &req.Y)
+	log.Printf("%#v", req)
 }
