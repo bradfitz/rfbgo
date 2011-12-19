@@ -16,6 +16,9 @@ limitations under the License.
 
 // toy VNC (RFB) server in Go, just learning the protocol.
 //
+// Protocol docs:
+//    http://www.realvnc.com/docs/rfbproto.pdf
+//
 // Author: Brad Fitzpatrick <brad@danga.com>
 
 package main
