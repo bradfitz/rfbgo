@@ -27,8 +27,11 @@ import (
 	"bufio"
 	"encoding/binary"
 	"fmt"
+	"image"
+	"image/color"
 	"log"
 	"net"
+	"sync"
 )
 
 func main() {
@@ -41,11 +44,7 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		conn := &Conn{
-			c:  c,
-			br: bufio.NewReader(c),
-			bw: bufio.NewWriter(c),
-		}
+		conn := NewConn(c)
 		go conn.serve()
 	}
 }
@@ -65,10 +64,55 @@ const (
 	cmdClientCutText            = 6
 )
 
+// Fixed stuff, for now:
+const (
+	deskWidth  = 800
+	deskHeight = 600
+)
+
+type LockableImage interface {
+	sync.Locker
+	Get() image.Image
+}
+
+type lockableImage struct {
+	sync.Mutex
+	im image.Image
+}
+
+func (i *lockableImage) Get() image.Image { return i.im }
+
 type Conn struct {
-	c  net.Conn
-	br *bufio.Reader
-	bw *bufio.Writer
+	c     net.Conn
+	br    *bufio.Reader
+	bw    *bufio.Writer
+	fbupc chan FrameBufferUpdateRequest
+
+	feed chan LockableImage
+	mu   sync.RWMutex // guards last (but not its pixels, just the variable)
+	last LockableImage
+}
+
+func NewConn(c net.Conn) *Conn {
+	im := image.NewRGBA(image.Rect(0, 0, deskWidth, deskHeight))
+	for y := 0; y < deskHeight; y++ {
+		for x := 0; x < deskWidth; x++ {
+			im.Set(x, y, color.RGBA{uint8(x), uint8(y), uint8(x + y), 0})
+		}
+	}
+
+	return &Conn{
+		c:     c,
+		br:    bufio.NewReader(c),
+		bw:    bufio.NewWriter(c),
+		fbupc: make(chan FrameBufferUpdateRequest, 128),
+		feed:  make(chan LockableImage, 10),
+		last:  &lockableImage{im: im},
+	}
+}
+
+func (c *Conn) dimensions() (w, h int) {
+	return deskWidth, deskHeight
 }
 
 func (c *Conn) readByte(what string) byte {
@@ -106,6 +150,7 @@ func (c *Conn) failf(format string, args ...interface{}) {
 
 func (c *Conn) serve() {
 	defer c.c.Close()
+	defer close(c.fbupc)
 	defer func() {
 		e := recover()
 		if e != nil {
@@ -158,7 +203,7 @@ func (c *Conn) serve() {
 	// TODO: send what Screens requests? PixelFormat{BPP:0x10, Depth:0x10,
 	// BigEndian:0x0, TrueColour:0x1, RedMax:0x1f, GreenMax:0x1f,
 	// BlueMax:0x1f, RedShift:0xa, GreenShift:0x5, BlueShift:0x0}
-	width, height := 1024, 768
+	width, height := c.dimensions()
 	c.w(uint16(width))
 	c.w(uint16(height))
 	c.w(uint8(32))   // bits-per-pixel
@@ -179,6 +224,7 @@ func (c *Conn) serve() {
 	c.bw.WriteString(serverName)
 	c.flush()
 
+	go c.pushFramesLoop()
 	for {
 		log.Printf("awaiting command byte from client...")
 		cmd := c.readByte("6.4:client-server-packet-type")
@@ -196,6 +242,23 @@ func (c *Conn) serve() {
 			c.handleKeyEvent()
 		default:
 			c.failf("unsupported command type %d from client", int(cmd))
+		}
+	}
+}
+
+func (c *Conn) pushFramesLoop() {
+	for {
+		select {
+		case ur, ok := <-c.fbupc:
+			if !ok {
+				// Client disconnected.
+				return
+			}
+			log.Printf("client wants update %#v", ur)
+		case li := <-c.feed:
+			c.mu.Lock()
+			c.last = li
+			c.mu.Unlock()
 		}
 	}
 }
@@ -256,7 +319,7 @@ func (c *Conn) handleUpdateRequest() {
 	c.read("framebuffer-update.y", &req.Y)
 	c.read("framebuffer-update.width", &req.Width)
 	c.read("framebuffer-update.height", &req.Height)
-	log.Printf("client requests update: %#v", req)
+	c.fbupc <- req
 }
 
 // 6.4.4
