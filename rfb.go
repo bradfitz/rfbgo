@@ -112,8 +112,18 @@ func NewConn(c net.Conn) *Conn {
 	im := image.NewRGBA(image.Rect(0, 0, deskWidth, deskHeight))
 	for y := 0; y < deskHeight; y++ {
 		for x := 0; x < deskWidth; x++ {
-			im.Set(x, y, color.RGBA{uint8(x), uint8(y), uint8(x + y), 0})
-			//im.Set(x, y, color.RGBA{255, 255, 0, 0})
+			c := color.RGBA{uint8(x), uint8(y), uint8(x + y), 0}
+			switch {
+			case x < 50:
+				c = color.RGBA{R: 255}
+			case x > 750:
+				c = color.RGBA{G: 255}
+			case y < 50:
+				c = color.RGBA{R: 255, G: 255}
+			case y > 550:
+				c = color.RGBA{B: 255}
+			}
+			im.Set(x, y, c)
 		}
 	}
 
