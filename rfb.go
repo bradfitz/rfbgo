@@ -352,7 +352,7 @@ func (c *Conn) pushFrame(ur FrameBufferUpdateRequest) {
 			col := im.At(x, y)
 			r16, g16, b16, _ := col.RGBA()
 			r16 = inRange(r16, c.format.RedMax)
-			g16 = inRange(b16, c.format.GreenMax)
+			g16 = inRange(g16, c.format.GreenMax)
 			b16 = inRange(b16, c.format.BlueMax)
 			var u32 uint32 = (r16 << c.format.RedShift) |
 				(g16 << c.format.GreenShift) |
@@ -368,7 +368,11 @@ func (c *Conn) pushFrame(ur FrameBufferUpdateRequest) {
 			default:
 				c.failf("TODO: BPP of %d", c.format.BPP)
 			}
-			c.w(v)
+			if c.format.BigEndian != 0 {
+				binary.Write(c.bw, binary.BigEndian, v)
+			} else {
+				binary.Write(c.bw, binary.LittleEndian, v)
+			}
 		}
 	}
 	c.flush()
