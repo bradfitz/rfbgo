@@ -60,7 +60,8 @@ const (
 	statusOK     = 0
 	statusFailed = 1
 
-	encodingRaw = 0
+	encodingRaw      = 0
+	encodingCopyRect = 1
 
 	// Client -> Server
 	cmdSetPixelFormat           = 0
@@ -111,8 +112,8 @@ func NewConn(c net.Conn) *Conn {
 	im := image.NewRGBA(image.Rect(0, 0, deskWidth, deskHeight))
 	for y := 0; y < deskHeight; y++ {
 		for x := 0; x < deskWidth; x++ {
-			//im.Set(x, y, color.RGBA{uint8(x), uint8(y), uint8(x + y), 0})
-			im.Set(x, y, color.RGBA{255, 255, 0, 0})
+			im.Set(x, y, color.RGBA{uint8(x), uint8(y), uint8(x + y), 0})
+			//im.Set(x, y, color.RGBA{255, 255, 0, 0})
 		}
 	}
 
@@ -301,21 +302,29 @@ func (c *Conn) pushFrame(ur FrameBufferUpdateRequest) {
 	li.Lock()
 	defer li.Unlock()
 
+	im := li.Get()
+	b := im.Bounds()
+	width, height := b.Dx(), b.Dy()
+
 	if ur.incremental() {
 		log.Printf("Client wants incremental update, sending none. %#v", ur)
 		c.w(uint8(cmdFramebufferUpdate))
-		c.w(uint8(0))  // padding byte
-		c.w(uint16(0)) // no rectangles
+		c.w(uint8(0))      // padding byte
+		c.w(uint16(1))     // no rectangles
+		c.w(uint16(0))     // x
+		c.w(uint16(0))     // y
+		c.w(uint16(width)) // x
+		c.w(uint16(height))
+		c.w(int32(encodingCopyRect))
+		c.w(uint16(0)) // src-x
+		c.w(uint16(0)) // src-y
+		c.flush()
 		return
 	}
 	c.w(uint8(cmdFramebufferUpdate))
 	c.w(uint8(0))  // padding byte
 	c.w(uint16(1)) // 1 rectangle
 
-	im := li.Get()
-	b := im.Bounds()
-
-	width, height := b.Dx(), b.Dy()
 	log.Printf("sending %d x %d pixels", width, height)
 
 	if c.format.TrueColour == 0 {
