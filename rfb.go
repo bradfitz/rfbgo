@@ -31,6 +31,7 @@ import (
 	"image/color"
 	"log"
 	"net"
+	"strconv"
 	"sync"
 )
 
@@ -50,18 +51,27 @@ func main() {
 }
 
 const (
-	v3                          = "RFB 003.003\n"
-	v7                          = "RFB 003.007\n"
-	v8                          = "RFB 003.008\n"
-	authNone                    = 1
-	statusOK                    = 0
-	statusFailed                = 1
+	v3 = "RFB 003.003\n"
+	v7 = "RFB 003.007\n"
+	v8 = "RFB 003.008\n"
+
+	authNone = 1
+
+	statusOK     = 0
+	statusFailed = 1
+
+	encodingRaw = 0
+
+	// Client -> Server
 	cmdSetPixelFormat           = 0
 	cmdSetEncodings             = 2
 	cmdFramebufferUpdateRequest = 3
 	cmdKeyEvent                 = 4
 	cmdPointerEvent             = 5
 	cmdClientCutText            = 6
+
+	// Server -> Client
+	cmdFramebufferUpdate = 0
 )
 
 // Fixed stuff, for now:
@@ -88,6 +98,10 @@ type Conn struct {
 	bw    *bufio.Writer
 	fbupc chan FrameBufferUpdateRequest
 
+	// should only be mutated once during handshake, but then
+	// only read.
+	format PixelFormat
+
 	feed chan LockableImage
 	mu   sync.RWMutex // guards last (but not its pixels, just the variable)
 	last LockableImage
@@ -97,7 +111,8 @@ func NewConn(c net.Conn) *Conn {
 	im := image.NewRGBA(image.Rect(0, 0, deskWidth, deskHeight))
 	for y := 0; y < deskHeight; y++ {
 		for x := 0; x < deskWidth; x++ {
-			im.Set(x, y, color.RGBA{uint8(x), uint8(y), uint8(x + y), 0})
+			//im.Set(x, y, color.RGBA{uint8(x), uint8(y), uint8(x + y), 0})
+			im.Set(x, y, color.RGBA{255, 255, 0, 0})
 		}
 	}
 
@@ -199,6 +214,19 @@ func (c *Conn) serve() {
 	wantShared := c.readByte("shared-flag") != 0
 	_ = wantShared
 
+	c.format = PixelFormat{
+		BPP:        24,
+		Depth:      24,
+		BigEndian:  1,
+		TrueColour: 1,
+		RedMax:     255,
+		GreenMax:   255,
+		BlueMax:    255,
+		RedShift:   16,
+		GreenShift: 8,
+		BlueShift:  0,
+	}
+
 	// 6.3.2. ServerInit
 	// TODO: send what Screens requests? PixelFormat{BPP:0x10, Depth:0x10,
 	// BigEndian:0x0, TrueColour:0x1, RedMax:0x1f, GreenMax:0x1f,
@@ -206,19 +234,19 @@ func (c *Conn) serve() {
 	width, height := c.dimensions()
 	c.w(uint16(width))
 	c.w(uint16(height))
-	c.w(uint8(32))   // bits-per-pixel
-	c.w(uint8(32))   // depth
-	c.w(uint8(1))    // big-endian-flag
-	c.w(uint8(1))    // true-colour-flag
-	c.w(uint16(255)) // red-max
-	c.w(uint16(255)) // green-max
-	c.w(uint16(255)) // blue-max
-	c.w(uint8(16))   // red-shift
-	c.w(uint8(8))    // green-shift
-	c.w(uint8(0))    // blue-shift
-	c.w(uint8(0))    // pad1
-	c.w(uint8(0))    // pad2
-	c.w(uint8(0))    // pad3
+	c.w(c.format.BPP)
+	c.w(c.format.Depth)
+	c.w(c.format.BigEndian)
+	c.w(c.format.TrueColour)
+	c.w(c.format.RedMax)
+	c.w(c.format.GreenMax)
+	c.w(c.format.BlueMax)
+	c.w(c.format.RedShift)
+	c.w(c.format.GreenShift)
+	c.w(c.format.BlueShift)
+	c.w(uint8(0)) // pad1
+	c.w(uint8(0)) // pad2
+	c.w(uint8(0)) // pad3
 	serverName := "rfb-go"
 	c.w(int32(len(serverName)))
 	c.bw.WriteString(serverName)
@@ -254,13 +282,79 @@ func (c *Conn) pushFramesLoop() {
 				// Client disconnected.
 				return
 			}
-			log.Printf("client wants update %#v", ur)
+			c.pushFrame(ur)
 		case li := <-c.feed:
 			c.mu.Lock()
 			c.last = li
 			c.mu.Unlock()
 		}
 	}
+}
+
+func (c *Conn) pushFrame(ur FrameBufferUpdateRequest) {
+	c.mu.Lock()
+	li := c.last
+	c.mu.Unlock()
+	if li == nil {
+		return
+	}
+	li.Lock()
+	defer li.Unlock()
+
+	if ur.incremental() {
+		log.Printf("Client wants incremental update, sending none. %#v", ur)
+		c.w(uint8(cmdFramebufferUpdate))
+		c.w(uint8(0))  // padding byte
+		c.w(uint16(0)) // no rectangles
+		return
+	}
+	c.w(uint8(cmdFramebufferUpdate))
+	c.w(uint8(0))  // padding byte
+	c.w(uint16(1)) // 1 rectangle
+
+	im := li.Get()
+	b := im.Bounds()
+
+	width, height := b.Dx(), b.Dy()
+	log.Printf("sending %d x %d pixels", width, height)
+
+	if c.format.TrueColour == 0 {
+		c.failf("only true-colour supported")
+	}
+
+	// Send that rectangle:
+	c.w(uint16(0))     // x
+	c.w(uint16(0))     // y
+	c.w(uint16(width)) // x
+	c.w(uint16(height))
+	c.w(int32(encodingRaw))
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			col := im.At(x, y)
+			r16, g16, b16, _ := col.RGBA()
+			r16 = inRange(r16, c.format.RedMax)
+			g16 = inRange(b16, c.format.GreenMax)
+			b16 = inRange(b16, c.format.BlueMax)
+			var u32 uint32 = (r16 << c.format.RedShift) |
+				(g16 << c.format.GreenShift) |
+				(b16 << c.format.BlueShift)
+			var v interface{}
+			switch c.format.BPP {
+			case 32:
+				v = u32
+			case 16:
+				v = uint16(u32)
+			case 8:
+				v = uint8(u32)
+			default:
+				c.failf("TODO: BPP of %d", c.format.BPP)
+			}
+			c.w(v)
+		}
+	}
+	c.flush()
+
+	log.Printf("sent client full update %#v", ur)
 }
 
 type PixelFormat struct {
@@ -287,6 +381,7 @@ func (c *Conn) handleSetPixelFormat() {
 	c.read("pixelformat.blueshift", &pf.BlueShift)
 	c.readPadding("SetPixelFormat pixel format padding", 3)
 	log.Printf("Client wants pixel format: %#v", pf)
+	c.format = pf
 }
 
 // 6.4.2
@@ -310,6 +405,8 @@ type FrameBufferUpdateRequest struct {
 	IncrementalFlag     uint8
 	X, Y, Width, Height uint16
 }
+
+func (r *FrameBufferUpdateRequest) incremental() bool { return r.IncrementalFlag != 0 }
 
 // 6.4.3
 func (c *Conn) handleUpdateRequest() {
@@ -350,4 +447,12 @@ func (c *Conn) handlePointerEvent() {
 	c.read("pointer-event.x", &req.X)
 	c.read("pointer-event.y", &req.Y)
 	log.Printf("%#v", req)
+}
+
+func inRange(v uint32, max uint16) uint32 {
+	switch max {
+	case 0x1f: // 5 bits
+		return v >> (16 - 5)
+	}
+	panic("todo; max value = " + strconv.Itoa(int(max)))
 }
