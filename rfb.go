@@ -33,6 +33,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"time"
 )
 
 func main() {
@@ -94,10 +95,11 @@ type lockableImage struct {
 func (i *lockableImage) Get() image.Image { return i.im }
 
 type Conn struct {
-	c     net.Conn
-	br    *bufio.Reader
-	bw    *bufio.Writer
-	fbupc chan FrameBufferUpdateRequest
+	c      net.Conn
+	br     *bufio.Reader
+	bw     *bufio.Writer
+	fbupc  chan FrameBufferUpdateRequest
+	closec chan bool // never sent; just closed
 
 	// should only be mutated once during handshake, but then
 	// only read.
@@ -110,30 +112,58 @@ type Conn struct {
 
 func NewConn(c net.Conn) *Conn {
 	im := image.NewRGBA(image.Rect(0, 0, deskWidth, deskHeight))
+	drawImage(im, 0)
+
+	conn := &Conn{
+		c:      c,
+		br:     bufio.NewReader(c),
+		bw:     bufio.NewWriter(c),
+		fbupc:  make(chan FrameBufferUpdateRequest, 128),
+		feed:   make(chan LockableImage, 10),
+		last:   &lockableImage{im: im},
+		closec: make(chan bool),
+	}
+	return conn
+}
+
+func (c *Conn) animateImage() {
+	for {
+		select {
+		case <-c.closec:
+			return
+		case <-time.After(time.Second / 30):
+			log.Printf("animate, slide=%d", slide)
+			c.updateImageFrame()
+		}
+	}
+}
+
+var slide = 0
+
+func (c *Conn) updateImageFrame() {
+	c.last.Lock()
+	slide++
+	drawImage(c.last.Get().(*image.RGBA), slide)
+	c.last.Unlock()
+	c.feed <- c.last
+}
+
+func drawImage(im *image.RGBA, off int) {
 	for y := 0; y < deskHeight; y++ {
 		for x := 0; x < deskWidth; x++ {
-			c := color.RGBA{uint8(x), uint8(y), uint8(x + y), 0}
+			c := color.RGBA{uint8(x), uint8(y), uint8(x + y + off), 0}
 			switch {
-			case x < 50:
+			case x < (slide % 50):
 				c = color.RGBA{R: 255}
 			case x > 750:
 				c = color.RGBA{G: 255}
-			case y < 50:
+			case y < 50 - (slide % 50):
 				c = color.RGBA{R: 255, G: 255}
 			case y > 550:
 				c = color.RGBA{B: 255}
 			}
 			im.Set(x, y, c)
 		}
-	}
-
-	return &Conn{
-		c:     c,
-		br:    bufio.NewReader(c),
-		bw:    bufio.NewWriter(c),
-		fbupc: make(chan FrameBufferUpdateRequest, 128),
-		feed:  make(chan LockableImage, 10),
-		last:  &lockableImage{im: im},
 	}
 }
 
@@ -177,6 +207,7 @@ func (c *Conn) failf(format string, args ...interface{}) {
 func (c *Conn) serve() {
 	defer c.c.Close()
 	defer close(c.fbupc)
+	defer close(c.closec)
 	defer func() {
 		e := recover()
 		if e != nil {
@@ -295,28 +326,30 @@ func (c *Conn) pushFramesLoop() {
 			}
 			c.pushFrame(ur)
 		case li := <-c.feed:
+			log.Printf("pushing image from feed")
 			c.mu.Lock()
 			c.last = li
 			c.mu.Unlock()
+			c.pushImage(li)
 		}
 	}
 }
 
 func (c *Conn) pushFrame(ur FrameBufferUpdateRequest) {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	li := c.last
-	c.mu.Unlock()
 	if li == nil {
 		return
 	}
-	li.Lock()
-	defer li.Unlock()
-
-	im := li.Get()
-	b := im.Bounds()
-	width, height := b.Dx(), b.Dy()
 
 	if ur.incremental() {
+		li.Lock()
+		defer li.Unlock()
+		im := li.Get()
+		b := im.Bounds()
+		width, height := b.Dx(), b.Dy()
+
 		log.Printf("Client wants incremental update, sending none. %#v", ur)
 		c.w(uint8(cmdFramebufferUpdate))
 		c.w(uint8(0))      // padding byte
@@ -331,6 +364,17 @@ func (c *Conn) pushFrame(ur FrameBufferUpdateRequest) {
 		c.flush()
 		return
 	}
+	c.pushImage(li)
+}
+
+func (c *Conn) pushImage(li LockableImage) {
+	li.Lock()
+	defer li.Unlock()
+
+	im := li.Get()
+	b := im.Bounds()
+	width, height := b.Dx(), b.Dy()
+
 	c.w(uint8(cmdFramebufferUpdate))
 	c.w(uint8(0))  // padding byte
 	c.w(uint16(1)) // 1 rectangle
@@ -376,8 +420,6 @@ func (c *Conn) pushFrame(ur FrameBufferUpdateRequest) {
 		}
 	}
 	c.flush()
-
-	log.Printf("sent client full update %#v", ur)
 }
 
 type PixelFormat struct {
@@ -405,6 +447,11 @@ func (c *Conn) handleSetPixelFormat() {
 	c.readPadding("SetPixelFormat pixel format padding", 3)
 	log.Printf("Client wants pixel format: %#v", pf)
 	c.format = pf
+
+	// TODO: not the right place to start this, but works for now.
+	// We just want to make sure that the client has sent their preference
+	// first.
+	go c.animateImage()
 }
 
 // 6.4.2
