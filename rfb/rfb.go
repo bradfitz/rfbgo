@@ -21,45 +21,18 @@ limitations under the License.
 //
 // Author: Brad Fitzpatrick <brad@danga.com>
 
-package main
+package rfb
 
 import (
 	"bufio"
 	"encoding/binary"
-	"flag"
 	"fmt"
 	"image"
-	"image/color"
 	"log"
 	"net"
-	"os"
-	"runtime/pprof"
 	"strconv"
 	"sync"
-	"time"
 )
-
-var (
-	profile = flag.Bool("profile", false, "write a cpu.prof file")
-	listen  = flag.String("listen", ":5900", "listen on [ip]:port")
-)
-
-func main() {
-	flag.Parse()
-
-	ln, err := net.Listen("tcp", *listen)
-	if err != nil {
-		log.Fatal(err)
-	}
-	for {
-		c, err := ln.Accept()
-		if err != nil {
-			log.Fatal(err)
-		}
-		conn := NewConn(c)
-		go conn.serve()
-	}
-}
 
 const (
 	v3 = "RFB 003.003\n"
@@ -86,18 +59,72 @@ const (
 	cmdFramebufferUpdate = 0
 )
 
-// Fixed stuff, for now:
-const (
-	deskWidth  = 1280
-	deskHeight = 720
-)
+func NewServer(width, height int) *Server {
+	if width < 1 {
+		width = 1
+	}
+	if height < 1 {
+		height = 1
+	}
+	conns := make(chan *Conn, 16)
+	return &Server{
+		width:  width,
+		height: height,
+		Conns:  conns,
+		conns:  conns,
+	}
+}
+
+type Server struct {
+	width, height int
+	conns         chan *Conn // read/write version of Conns
+
+	// Conns is a channel of incoming connections.
+	Conns <-chan *Conn
+}
+
+func (s *Server) Serve(ln net.Listener) error {
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			return err
+		}
+		conn := s.newConn(c)
+		select {
+		case s.conns <- conn:
+		default:
+			// client is behind; doesn't get this updated.
+		}
+		go conn.serve()
+	}
+	panic("unreachable")
+}
+
+func (s *Server) newConn(c net.Conn) *Conn {
+	feed := make(chan *LockableImage, 16)
+	event := make(chan interface{}, 16)
+	conn := &Conn{
+		s:      s,
+		c:      c,
+		br:     bufio.NewReader(c),
+		bw:     bufio.NewWriter(c),
+		fbupc:  make(chan FrameBufferUpdateRequest, 128),
+		closec: make(chan bool),
+		feed:   feed,
+		Feed:   feed, // the send-only version
+		event:  event,
+		Event:  event, // the recieve-only version
+	}
+	return conn
+}
 
 type LockableImage struct {
-	sync.Mutex
+	sync.RWMutex
 	Img image.Image
 }
 
 type Conn struct {
+	s      *Server
 	c      net.Conn
 	br     *bufio.Reader
 	bw     *bufio.Writer
@@ -113,73 +140,22 @@ type Conn struct {
 	last *LockableImage
 
 	buf8 []uint8 // temporary buffer to avoid generating garbage
-}
 
-func NewConn(c net.Conn) *Conn {
-	im := image.NewRGBA(image.Rect(0, 0, deskWidth, deskHeight))
-	drawImage(im, 0)
+	// Feed is the channel to send new frames.
+	Feed chan<- *LockableImage
 
-	conn := &Conn{
-		c:      c,
-		br:     bufio.NewReader(c),
-		bw:     bufio.NewWriter(c),
-		fbupc:  make(chan FrameBufferUpdateRequest, 128),
-		feed:   make(chan *LockableImage, 10),
-		last:   &LockableImage{Img: im},
-		closec: make(chan bool),
-	}
-	return conn
-}
+	// Event is a readable channel of events from the client.
+	// The value will be either a KeyEvent or PointerEvent.  The
+	// channel is closed when the client disconnects.
+	Event <-chan interface{}
 
-func (c *Conn) animateImage() {
-	tick := time.NewTicker(time.Second / 30)
-	defer tick.Stop()
-	for {
-		select {
-		case <-c.closec:
-			return
-		case <-tick.C:
-			log.Printf("animate, slide=%d", slide)
-			c.updateImageFrame()
-		}
-	}
-}
+	event chan interface{} // internal version of Event
 
-var slide = 0
-
-func (c *Conn) updateImageFrame() {
-	c.last.Lock()
-	slide++
-	drawImage(c.last.Img.(*image.RGBA), slide)
-	c.last.Unlock()
-	c.feed <- c.last
-}
-
-func drawImage(im *image.RGBA, off int) {
-	pos := 0
-	for y := 0; y < deskHeight; y++ {
-		for x := 0; x < deskWidth; x++ {
-			c := color.RGBA{uint8(x), uint8(y), uint8(x + y + off), 0}
-			switch {
-			case x < (slide % 50):
-				c = color.RGBA{R: 255}
-			case x > deskWidth - 50:
-				c = color.RGBA{G: 255}
-			case y < 50-(slide%50):
-				c = color.RGBA{R: 255, G: 255}
-			case y > deskHeight - 50:
-				c = color.RGBA{B: 255}
-			}
-			im.Pix[pos] = c.R
-			im.Pix[pos+1] = c.G
-			im.Pix[pos+2] = c.B
-			pos += 4 // skipping alpha
-		}
-	}
+	gotFirstFrame bool
 }
 
 func (c *Conn) dimensions() (w, h int) {
-	return deskWidth, deskHeight
+	return c.s.width, c.s.height
 }
 
 func (c *Conn) readByte(what string) byte {
@@ -225,20 +201,6 @@ func (c *Conn) serve() {
 			log.Printf("Client disconnect: %v", e)
 		}
 	}()
-
-	if *profile {
-		f, err := os.Create("cpu.prof")
-		if err != nil {
-			log.Fatal(err)
-		}
-		err = pprof.StartCPUProfile(f)
-		if err != nil {
-			log.Fatal(err)
-		}
-		log.Printf("profiling CPU")
-		defer pprof.StopCPUProfile()
-		defer log.Printf("stopping profiling CPU")
-	}
 
 	c.bw.WriteString("RFB 003.008\n")
 	c.flush()
@@ -319,7 +281,6 @@ func (c *Conn) serve() {
 	c.bw.WriteString(serverName)
 	c.flush()
 
-	go c.pushFramesLoop()
 	for {
 		//log.Printf("awaiting command byte from client...")
 		cmd := c.readByte("6.4:client-server-packet-type")
@@ -360,8 +321,8 @@ func (c *Conn) pushFramesLoop() {
 }
 
 func (c *Conn) pushFrame(ur FrameBufferUpdateRequest) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	li := c.last
 	if li == nil {
 		return
@@ -529,10 +490,7 @@ func (c *Conn) handleSetPixelFormat() {
 	log.Printf("Client wants pixel format: %#v", pf)
 	c.format = pf
 
-	// TODO: not the right place to start this, but works for now.
-	// We just want to make sure that the client has sent their preference
-	// first.
-	go c.animateImage()
+	// TODO: send PixelFormat event? would clients care?
 }
 
 // 6.4.2
@@ -561,6 +519,15 @@ func (r *FrameBufferUpdateRequest) incremental() bool { return r.IncrementalFlag
 
 // 6.4.3
 func (c *Conn) handleUpdateRequest() {
+	if !c.gotFirstFrame {
+		li := <-c.feed
+		c.mu.Lock()
+		c.last = li
+		c.mu.Unlock()
+		c.gotFirstFrame = true
+		go c.pushFramesLoop()
+	}
+
 	var req FrameBufferUpdateRequest
 	c.read("framebuffer-update.incremental", &req.IncrementalFlag)
 	c.read("framebuffer-update.x", &req.X)
@@ -582,7 +549,11 @@ func (c *Conn) handleKeyEvent() {
 	c.read("key-event.downflag", &req.DownFlag)
 	c.readPadding("key-event.padding", 2)
 	c.read("key-event.key", &req.Key)
-	log.Printf("%#v", req)
+	select {
+	case c.event <- req:
+	default:
+		// Client's too slow.
+	}
 }
 
 // 6.4.5
@@ -597,7 +568,11 @@ func (c *Conn) handlePointerEvent() {
 	c.read("pointer-event.mask", &req.ButtonMask)
 	c.read("pointer-event.x", &req.X)
 	c.read("pointer-event.y", &req.Y)
-	log.Printf("%#v", req)
+	select {
+	case c.event <- req:
+	default:
+		// Client's too slow.
+	}
 }
 
 func inRange(v uint32, max uint16) uint32 {
