@@ -41,12 +41,13 @@ import (
 
 var (
 	profile = flag.Bool("profile", false, "write a cpu.prof file")
+	listen  = flag.String("listen", ":5900", "listen on [ip]:port")
 )
 
 func main() {
 	flag.Parse()
 
-	ln, err := net.Listen("tcp", ":5901")
+	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -117,6 +118,8 @@ type Conn struct {
 	feed chan LockableImage
 	mu   sync.RWMutex // guards last (but not its pixels, just the variable)
 	last LockableImage
+
+	buf16 []uint16 // temporary buffer to avoid generating garbage
 }
 
 func NewConn(c net.Conn) *Conn {
@@ -396,6 +399,9 @@ func (c *Conn) pushImage(li LockableImage) {
 
 	im := li.Get()
 	b := im.Bounds()
+	if b.Min.X != 0 || b.Min.Y != 0 {
+		panic("this code is lazy and assumes images with Min bounds at 0,0")
+	}
 	width, height := b.Dx(), b.Dy()
 
 	c.w(uint8(cmdFramebufferUpdate))
@@ -414,6 +420,46 @@ func (c *Conn) pushImage(li LockableImage) {
 	c.w(uint16(width)) // x
 	c.w(uint16(height))
 	c.w(int32(encodingRaw))
+
+	rgba, isRGBA := im.(*image.RGBA)
+	if isRGBA && c.format.isScreensThousands() {
+		// Fast path.
+		c.pushRGBAScreensThousandsLocked(rgba)
+	} else {
+		c.pushGenericLocked(im)
+	}
+	c.flush()
+}
+
+func (c *Conn) pushRGBAScreensThousandsLocked(im *image.RGBA) {
+	var u16 uint16
+	var buf = c.buf16[:0]
+	for i, v8 := range im.Pix {
+		switch i % 4 {
+		case 0: // red
+			u16 = uint16(v8&248) << 7 // 3 masked bits + 7 shifted == redshift of 10
+		case 1: // green
+			u16 |= uint16(v8&248) << 2 // redshift of 5
+		case 2: // blue
+			u16 |= uint16(v8 >> 3)
+		case 3: // alpha, unused.  use this to just move the dest
+			buf = append(buf, u16)
+		}
+	}
+	if c.format.BigEndian != 0 {
+		binary.Write(c.bw, binary.BigEndian, buf)
+	} else {
+		binary.Write(c.bw, binary.LittleEndian, buf)
+	}
+	c.buf16 = buf
+}
+
+// pushGenericLocked is the slow path generic implementation that works on
+// any image.Image concrete type and any client-requested pixel format.
+// If you're lucky, you never end in this path.
+func (c *Conn) pushGenericLocked(im image.Image) {
+	b := im.Bounds()
+	width, height := b.Dx(), b.Dy()
 	for y := 0; y < height; y++ {
 		for x := 0; x < width; x++ {
 			col := im.At(x, y)
@@ -442,7 +488,6 @@ func (c *Conn) pushImage(li LockableImage) {
 			}
 		}
 	}
-	c.flush()
 }
 
 type PixelFormat struct {
@@ -450,6 +495,13 @@ type PixelFormat struct {
 	BigEndian, TrueColour           uint8 // flags; 0 or non-zero
 	RedMax, GreenMax, BlueMax       uint16
 	RedShift, GreenShift, BlueShift uint8
+}
+
+// Is the format requested by the OS X "Screens" app's "Thousands" mode.
+func (f *PixelFormat) isScreensThousands() bool {
+	return f.BPP == 16 && f.Depth == 16 && f.TrueColour != 0 &&
+		f.RedMax == 0x1f && f.GreenMax == 0x1f && f.BlueMax == 0x1f &&
+		f.RedShift == 10 && f.GreenShift == 5 && f.BlueShift == 0
 }
 
 // 6.4.1
