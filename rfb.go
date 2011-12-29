@@ -88,8 +88,8 @@ const (
 
 // Fixed stuff, for now:
 const (
-	deskWidth  = 800
-	deskHeight = 600
+	deskWidth  = 1280
+	deskHeight = 720
 )
 
 type LockableImage struct {
@@ -132,7 +132,7 @@ func NewConn(c net.Conn) *Conn {
 }
 
 func (c *Conn) animateImage() {
-	tick := time.NewTicker(5 * time.Millisecond)
+	tick := time.NewTicker(time.Second / 30)
 	defer tick.Stop()
 	for {
 		select {
@@ -163,11 +163,11 @@ func drawImage(im *image.RGBA, off int) {
 			switch {
 			case x < (slide % 50):
 				c = color.RGBA{R: 255}
-			case x > 750:
+			case x > deskWidth - 50:
 				c = color.RGBA{G: 255}
 			case y < 50-(slide%50):
 				c = color.RGBA{R: 255, G: 255}
-			case y > 550:
+			case y > deskHeight - 50:
 				c = color.RGBA{B: 255}
 			}
 			im.Pix[pos] = c.R
