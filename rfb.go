@@ -92,17 +92,10 @@ const (
 	deskHeight = 600
 )
 
-type LockableImage interface {
-	sync.Locker
-	Get() image.Image
-}
-
-type lockableImage struct {
+type LockableImage struct {
 	sync.Mutex
-	im image.Image
+	Img image.Image
 }
-
-func (i *lockableImage) Get() image.Image { return i.im }
 
 type Conn struct {
 	c      net.Conn
@@ -115,11 +108,11 @@ type Conn struct {
 	// only read.
 	format PixelFormat
 
-	feed chan LockableImage
+	feed chan *LockableImage
 	mu   sync.RWMutex // guards last (but not its pixels, just the variable)
-	last LockableImage
+	last *LockableImage
 
-	buf16 []uint16 // temporary buffer to avoid generating garbage
+	buf8 []uint8 // temporary buffer to avoid generating garbage
 }
 
 func NewConn(c net.Conn) *Conn {
@@ -131,19 +124,21 @@ func NewConn(c net.Conn) *Conn {
 		br:     bufio.NewReader(c),
 		bw:     bufio.NewWriter(c),
 		fbupc:  make(chan FrameBufferUpdateRequest, 128),
-		feed:   make(chan LockableImage, 10),
-		last:   &lockableImage{im: im},
+		feed:   make(chan *LockableImage, 10),
+		last:   &LockableImage{Img: im},
 		closec: make(chan bool),
 	}
 	return conn
 }
 
 func (c *Conn) animateImage() {
+	tick := time.NewTicker(5 * time.Millisecond)
+	defer tick.Stop()
 	for {
 		select {
 		case <-c.closec:
 			return
-		case <-time.After(time.Second / 30):
+		case <-tick.C:
 			log.Printf("animate, slide=%d", slide)
 			c.updateImageFrame()
 		}
@@ -155,12 +150,13 @@ var slide = 0
 func (c *Conn) updateImageFrame() {
 	c.last.Lock()
 	slide++
-	drawImage(c.last.Get().(*image.RGBA), slide)
+	drawImage(c.last.Img.(*image.RGBA), slide)
 	c.last.Unlock()
 	c.feed <- c.last
 }
 
 func drawImage(im *image.RGBA, off int) {
+	pos := 0
 	for y := 0; y < deskHeight; y++ {
 		for x := 0; x < deskWidth; x++ {
 			c := color.RGBA{uint8(x), uint8(y), uint8(x + y + off), 0}
@@ -174,7 +170,10 @@ func drawImage(im *image.RGBA, off int) {
 			case y > 550:
 				c = color.RGBA{B: 255}
 			}
-			im.Set(x, y, c)
+			im.Pix[pos] = c.R
+			im.Pix[pos+1] = c.G
+			im.Pix[pos+2] = c.B
+			pos += 4 // skipping alpha
 		}
 	}
 }
@@ -322,9 +321,9 @@ func (c *Conn) serve() {
 
 	go c.pushFramesLoop()
 	for {
-		log.Printf("awaiting command byte from client...")
+		//log.Printf("awaiting command byte from client...")
 		cmd := c.readByte("6.4:client-server-packet-type")
-		log.Printf("got command type %d from client", int(cmd))
+		//log.Printf("got command type %d from client", int(cmd))
 		switch cmd {
 		case cmdSetPixelFormat:
 			c.handleSetPixelFormat()
@@ -352,7 +351,6 @@ func (c *Conn) pushFramesLoop() {
 			}
 			c.pushFrame(ur)
 		case li := <-c.feed:
-			log.Printf("pushing image from feed")
 			c.mu.Lock()
 			c.last = li
 			c.mu.Unlock()
@@ -372,11 +370,11 @@ func (c *Conn) pushFrame(ur FrameBufferUpdateRequest) {
 	if ur.incremental() {
 		li.Lock()
 		defer li.Unlock()
-		im := li.Get()
+		im := li.Img
 		b := im.Bounds()
 		width, height := b.Dx(), b.Dy()
 
-		log.Printf("Client wants incremental update, sending none. %#v", ur)
+		//log.Printf("Client wants incremental update, sending none. %#v", ur)
 		c.w(uint8(cmdFramebufferUpdate))
 		c.w(uint8(0))      // padding byte
 		c.w(uint16(1))     // no rectangles
@@ -393,11 +391,11 @@ func (c *Conn) pushFrame(ur FrameBufferUpdateRequest) {
 	c.pushImage(li)
 }
 
-func (c *Conn) pushImage(li LockableImage) {
+func (c *Conn) pushImage(li *LockableImage) {
 	li.Lock()
 	defer li.Unlock()
 
-	im := li.Get()
+	im := li.Img
 	b := im.Bounds()
 	if b.Min.X != 0 || b.Min.Y != 0 {
 		panic("this code is lazy and assumes images with Min bounds at 0,0")
@@ -408,7 +406,7 @@ func (c *Conn) pushImage(li LockableImage) {
 	c.w(uint8(0))  // padding byte
 	c.w(uint16(1)) // 1 rectangle
 
-	log.Printf("sending %d x %d pixels", width, height)
+	//log.Printf("sending %d x %d pixels", width, height)
 
 	if c.format.TrueColour == 0 {
 		c.failf("only true-colour supported")
@@ -433,7 +431,12 @@ func (c *Conn) pushImage(li LockableImage) {
 
 func (c *Conn) pushRGBAScreensThousandsLocked(im *image.RGBA) {
 	var u16 uint16
-	var buf = c.buf16[:0]
+	pixels := len(im.Pix) / 4
+	if len(c.buf8) < pixels*2 {
+		c.buf8 = make([]byte, pixels*2)
+	}
+	out := c.buf8[:]
+	isBigEndian := c.format.BigEndian != 0
 	for i, v8 := range im.Pix {
 		switch i % 4 {
 		case 0: // red
@@ -443,15 +446,18 @@ func (c *Conn) pushRGBAScreensThousandsLocked(im *image.RGBA) {
 		case 2: // blue
 			u16 |= uint16(v8 >> 3)
 		case 3: // alpha, unused.  use this to just move the dest
-			buf = append(buf, u16)
+			hb, lb := uint8(u16>>8), uint8(u16)
+			if isBigEndian {
+				out[0] = hb
+				out[1] = lb
+			} else {
+				out[0] = lb
+				out[1] = hb
+			}
+			out = out[2:]
 		}
 	}
-	if c.format.BigEndian != 0 {
-		binary.Write(c.bw, binary.BigEndian, buf)
-	} else {
-		binary.Write(c.bw, binary.LittleEndian, buf)
-	}
-	c.buf16 = buf
+	c.bw.Write(c.buf8[:pixels*2])
 }
 
 // pushGenericLocked is the slow path generic implementation that works on
