@@ -26,17 +26,26 @@ package main
 import (
 	"bufio"
 	"encoding/binary"
+	"flag"
 	"fmt"
 	"image"
 	"image/color"
 	"log"
 	"net"
+	"os"
+	"runtime/pprof"
 	"strconv"
 	"sync"
 	"time"
 )
 
+var (
+	profile = flag.Bool("profile", false, "write a cpu.prof file")
+)
+
 func main() {
+	flag.Parse()
+
 	ln, err := net.Listen("tcp", ":5901")
 	if err != nil {
 		log.Fatal(err)
@@ -157,7 +166,7 @@ func drawImage(im *image.RGBA, off int) {
 				c = color.RGBA{R: 255}
 			case x > 750:
 				c = color.RGBA{G: 255}
-			case y < 50 - (slide % 50):
+			case y < 50-(slide%50):
 				c = color.RGBA{R: 255, G: 255}
 			case y > 550:
 				c = color.RGBA{B: 255}
@@ -214,6 +223,20 @@ func (c *Conn) serve() {
 			log.Printf("Client disconnect: %v", e)
 		}
 	}()
+
+	if *profile {
+		f, err := os.Create("cpu.prof")
+		if err != nil {
+			log.Fatal(err)
+		}
+		err = pprof.StartCPUProfile(f)
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("profiling CPU")
+		defer pprof.StopCPUProfile()
+		defer log.Printf("stopping profiling CPU")
+	}
 
 	c.bw.WriteString("RFB 003.008\n")
 	c.flush()
