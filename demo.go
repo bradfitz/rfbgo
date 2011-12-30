@@ -84,8 +84,16 @@ func handleConn(c *rfb.Conn) {
 		slide := 0
 		tick := time.NewTicker(time.Second / 30)
 		defer tick.Stop()
+		haveNewFrame := false
 		for {
+			feed := c.Feed
+			if !haveNewFrame {
+				feed = nil
+			}
+			_ = feed
 			select {
+			case feed <- li:
+				haveNewFrame = false
 			case <-closec:
 				return
 			case <-tick.C:
@@ -93,7 +101,7 @@ func handleConn(c *rfb.Conn) {
 				li.Lock()
 				drawImage(im, slide)
 				li.Unlock()
-				c.Feed <- li
+				haveNewFrame = true
 			}
 		}
 	}()

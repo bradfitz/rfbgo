@@ -195,6 +195,7 @@ func (c *Conn) serve() {
 	defer c.c.Close()
 	defer close(c.fbupc)
 	defer close(c.closec)
+	defer close(c.event)
 	defer func() {
 		e := recover()
 		if e != nil {
