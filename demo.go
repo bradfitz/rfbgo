@@ -23,8 +23,8 @@ package main
 import (
 	"flag"
 	"image"
-	"image/color"
 	"log"
+	"math"
 	"net"
 	"os"
 	"runtime/pprof"
@@ -115,22 +115,25 @@ func handleConn(c *rfb.Conn) {
 
 func drawImage(im *image.RGBA, anim int) {
 	pos := 0
+	const border = 50
 	for y := 0; y < height; y++ {
 		for x := 0; x < width; x++ {
-			c := color.RGBA{uint8(x), uint8(y), uint8(x + y + anim), 0}
+			var r, g, b uint8
 			switch {
-			case x < (anim % 50):
-				c = color.RGBA{R: 255}
-			case x > width-50:
-				c = color.RGBA{G: 255}
-			case y < 50-(anim%50):
-				c = color.RGBA{R: 255, G: 255}
-			case y > height-50:
-				c = color.RGBA{B: 255}
+			case x < border*2.5 && x < int((1.1+math.Sin(float64(y+anim*2)/40))*border):
+				r = 255
+			case x > width-border*2.5 && x > width-int((1.1+math.Sin(math.Pi+float64(y+anim*2)/40))*border):
+				g = 255
+			case y < border*2.5 && y < int((1.1+math.Sin(float64(x+anim*2)/40))*border):
+				r, g = 255, 255
+			case y > height-border*2.5 && y > height-int((1.1+math.Sin(math.Pi+float64(x+anim*2)/40))*border):
+				b = 255
+			default:
+				r, g, b = uint8(x+anim), uint8(y+anim), uint8(x+y+anim*3)
 			}
-			im.Pix[pos] = c.R
-			im.Pix[pos+1] = c.G
-			im.Pix[pos+2] = c.B
+			im.Pix[pos] = r
+			im.Pix[pos+1] = g
+			im.Pix[pos+2] = b
 			pos += 4 // skipping alpha
 		}
 	}
