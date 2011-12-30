@@ -245,22 +245,19 @@ func (c *Conn) serve() {
 	_ = wantShared
 
 	c.format = PixelFormat{
-		BPP:        24,
-		Depth:      24,
-		BigEndian:  1,
+		BPP:        16,
+		Depth:      16,
+		BigEndian:  0,
 		TrueColour: 1,
-		RedMax:     255,
-		GreenMax:   255,
-		BlueMax:    255,
-		RedShift:   16,
-		GreenShift: 8,
+		RedMax:     0x1f,
+		GreenMax:   0x1f,
+		BlueMax:    0x1f,
+		RedShift:   0xa,
+		GreenShift: 0x5,
 		BlueShift:  0,
 	}
 
 	// 6.3.2. ServerInit
-	// TODO: send what Screens requests? PixelFormat{BPP:0x10, Depth:0x10,
-	// BigEndian:0x0, TrueColour:0x1, RedMax:0x1f, GreenMax:0x1f,
-	// BlueMax:0x1f, RedShift:0xa, GreenShift:0x5, BlueShift:0x0}
 	width, height := c.dimensions()
 	c.w(uint16(width))
 	c.w(uint16(height))
