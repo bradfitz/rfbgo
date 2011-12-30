@@ -464,7 +464,9 @@ type PixelFormat struct {
 
 // Is the format requested by the OS X "Screens" app's "Thousands" mode.
 func (f *PixelFormat) isScreensThousands() bool {
-	return f.BPP == 16 && f.Depth == 16 && f.TrueColour != 0 &&
+	// Note: Screens asks for Depth 16; RealVNC asks for Depth 15 (which is more accurate)
+	// Accept either. Same format.
+	return f.BPP == 16 && (f.Depth == 16 || f.Depth == 15) && f.TrueColour != 0 &&
 		f.RedMax == 0x1f && f.GreenMax == 0x1f && f.BlueMax == 0x1f &&
 		f.RedShift == 10 && f.GreenShift == 5 && f.BlueShift == 0
 }
