@@ -1,4 +1,4 @@
-package main
+package rfb_test
 
 import (
 	"testing"
